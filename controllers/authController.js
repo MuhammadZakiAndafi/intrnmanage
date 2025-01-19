@@ -1,7 +1,7 @@
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const db = require('../config/database');
-const qr = require('qrcode');
+const qrcodeUtil = require('../utils/qrcode');
 const { v4: uuidv4 } = require('uuid');
 
 const authController = {
@@ -27,19 +27,8 @@ const authController = {
 
       // Hash password
       const hashedPassword = await bcrypt.hash(password, 10);
-
-      // Generate QR Code content (data mahasiswa)
-      const qrContent = JSON.stringify({
-        nim,
-        nama,
-        institusi,
-        id: uuidv4()
-      });
-
-      // Generate QR Code image
-      const qrCodeImage = await qr.toDataURL(qrContent);
       
-      // Insert user
+      // Create user account
       const [userResult] = await connection.execute(
         'INSERT INTO users (email, password, role, photo_profile) VALUES (?, ?, ?, NULL)',
         [email, hashedPassword, 'mahasiswa']
@@ -47,19 +36,27 @@ const authController = {
       
       const userId = userResult.insertId;
 
-      // Calculate sisa_hari
+      // Generate QR Code
+      const qrCodePath = await qrcodeUtil.generateMahasiswaQR({
+        id: userId,
+        nim,
+        nama
+      });
+
+      // Calculate remaining days
       const start = new Date(tanggal_mulai);
       const end = new Date(tanggal_selesai);
       const sisaHari = Math.ceil((end - start) / (1000 * 60 * 60 * 24));
 
-      // Insert mahasiswa
+      // Create mahasiswa profile
       await connection.execute(
-        `INSERT INTO mahasiswa (user_id, admin_id, nim, nama, institusi, 
-          jenis_kelamin, alamat, no_telepon, tanggal_mulai, tanggal_selesai, 
-          qr_code, status, sisa_hari) 
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'aktif', ?)`,
-        [userId, admin_id, nim, nama, institusi, jenis_kelamin, alamat, 
-         no_telepon, tanggal_mulai, tanggal_selesai, qrCodeImage, sisaHari]
+        `INSERT INTO mahasiswa (
+          user_id, admin_id, nim, nama, institusi,
+          jenis_kelamin, alamat, no_telepon, tanggal_mulai, tanggal_selesai,
+          qr_code, status, sisa_hari
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'aktif', ?)`,
+        [userId, admin_id, nim, nama, institusi, jenis_kelamin, alamat,
+         no_telepon, tanggal_mulai, tanggal_selesai, qrCodePath, sisaHari]
       );
 
       await connection.commit();
@@ -72,6 +69,12 @@ const authController = {
     } catch (error) {
       await connection.rollback();
       console.error('Register error:', error);
+      
+      // Delete QR code if exists
+      if (error.qrCodePath) {
+        await qrcodeUtil.deleteQRCode(error.qrCodePath);
+      }
+
       res.status(500).json({
         success: false,
         message: 'Terjadi kesalahan saat registrasi'
@@ -81,7 +84,7 @@ const authController = {
     }
   },
 
-  // Login user
+  // Login
   login: async (req, res) => {
     try {
       const { email, password } = req.body;
@@ -110,7 +113,7 @@ const authController = {
         });
       }
 
-      // Get additional user data based on role
+      // Get additional user data
       let additionalData = {};
       if (user.role === 'mahasiswa') {
         const [mahasiswa] = await db.execute(
@@ -120,20 +123,12 @@ const authController = {
         if (mahasiswa.length > 0) {
           additionalData = mahasiswa[0];
         }
-      } else if (user.role === 'admin') {
-        const [admin] = await db.execute(
-          'SELECT * FROM admin WHERE user_id = ?',
-          [user.id]
-        );
-        if (admin.length > 0) {
-          additionalData = admin[0];
-        }
       }
 
       // Generate JWT token
       const token = jwt.sign(
-        { 
-          id: user.id, 
+        {
+          id: user.id,
           role: user.role,
           email: user.email,
           ...additionalData
@@ -162,7 +157,7 @@ const authController = {
     }
   },
 
-  // Check validation code untuk akses scan QR
+  // Check validation code
   checkValidationCode: async (req, res) => {
     try {
       const { validation_code } = req.body;

@@ -1,7 +1,7 @@
 const db = require('../config/database');
 const bcrypt = require('bcryptjs');
+const qrcodeUtil = require('../utils/qrcode');
 const { v4: uuidv4 } = require('uuid');
-const qr = require('qrcode');
 
 const adminController = {
   // Get dashboard statistics
@@ -9,7 +9,7 @@ const adminController = {
     try {
       const adminId = req.user.id;
 
-      // Get mahasiswa data
+      // Get total active mahasiswa
       const [totalMahasiswa] = await db.execute(
         'SELECT COUNT(*) as total FROM mahasiswa WHERE admin_id = ? AND status = "aktif"',
         [adminId]
@@ -18,31 +18,31 @@ const adminController = {
       // Get today's attendance
       const today = new Date().toISOString().split('T')[0];
       const [todayAttendance] = await db.execute(
-        `SELECT COUNT(*) as total FROM absensi a 
-         JOIN mahasiswa m ON a.mahasiswa_id = m.id 
+        `SELECT COUNT(*) as total FROM absensi a
+         JOIN mahasiswa m ON a.mahasiswa_id = m.id
          WHERE m.admin_id = ? AND DATE(a.tanggal) = ?`,
         [adminId, today]
       );
 
       // Get pending permissions
       const [pendingPermissions] = await db.execute(
-        `SELECT COUNT(*) as total FROM izin i 
-         JOIN mahasiswa m ON i.mahasiswa_id = m.id 
+        `SELECT COUNT(*) as total FROM izin i
+         JOIN mahasiswa m ON i.mahasiswa_id = m.id
          WHERE m.admin_id = ? AND i.status = 'pending'`,
         [adminId]
       );
 
       // Get pending logbooks
       const [pendingLogbooks] = await db.execute(
-        `SELECT COUNT(*) as total FROM logbook l 
-         JOIN mahasiswa m ON l.mahasiswa_id = m.id 
+        `SELECT COUNT(*) as total FROM logbook l
+         JOIN mahasiswa m ON l.mahasiswa_id = m.id
          WHERE m.admin_id = ? AND l.status = 'pending'`,
         [adminId]
       );
 
       // Get weekly attendance stats
       const [weeklyStats] = await db.execute(
-        `SELECT 
+        `SELECT
            DATE(a.tanggal) as date,
            COUNT(CASE WHEN a.status_kehadiran = 'hadir' THEN 1 END) as hadir,
            COUNT(CASE WHEN a.status_kehadiran = 'izin' THEN 1 END) as izin,
@@ -50,13 +50,13 @@ const adminController = {
          FROM absensi a
          JOIN mahasiswa m ON a.mahasiswa_id = m.id
          WHERE m.admin_id = ?
-           AND a.tanggal >= DATE_SUB(CURRENT_DATE, INTERVAL 7 DAY)
+         AND a.tanggal >= DATE_SUB(CURRENT_DATE, INTERVAL 7 DAY)
          GROUP BY DATE(a.tanggal)
          ORDER BY DATE(a.tanggal)`,
         [adminId]
       );
 
-      // Get logbook statistics
+      // Get logbook status statistics
       const [logbookStats] = await db.execute(
         `SELECT
            COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending,
@@ -76,23 +76,23 @@ const adminController = {
           WHERE m.admin_id = ?
           ORDER BY l.created_at DESC
           LIMIT 3)
-        UNION ALL
-        (SELECT 'absensi' as type, a.created_at, m.nama,
-         CONCAT('melakukan absensi ', a.status_kehadiran) as activity
+         UNION ALL
+         (SELECT 'absensi' as type, a.created_at, m.nama,
+          CONCAT('melakukan absensi ', a.status_kehadiran) as activity
           FROM absensi a
           JOIN mahasiswa m ON a.mahasiswa_id = m.id
           WHERE m.admin_id = ?
           ORDER BY a.created_at DESC
           LIMIT 3)
-        UNION ALL
-        (SELECT 'izin' as type, i.created_at, m.nama, 'mengajukan izin baru' as activity
+         UNION ALL
+         (SELECT 'izin' as type, i.created_at, m.nama, 'mengajukan izin baru' as activity
           FROM izin i
           JOIN mahasiswa m ON i.mahasiswa_id = m.id
           WHERE m.admin_id = ?
           ORDER BY i.created_at DESC
           LIMIT 3)
-        ORDER BY created_at DESC
-        LIMIT 3`,
+         ORDER BY created_at DESC
+         LIMIT 3`,
         [adminId, adminId, adminId]
       );
 
@@ -108,6 +108,7 @@ const adminController = {
           recentActivities
         }
       });
+
     } catch (error) {
       console.error('Get dashboard stats error:', error);
       res.status(500).json({
@@ -127,7 +128,7 @@ const adminController = {
       const { nama, email } = req.body;
       const photoProfile = req.file ? req.file.filename : null;
 
-      // Update user data if email provided
+      // Update user data
       if (email) {
         await connection.execute(
           'UPDATE users SET email = ? WHERE id = ?',
@@ -135,7 +136,6 @@ const adminController = {
         );
       }
 
-      // Update photo if provided
       if (photoProfile) {
         await connection.execute(
           'UPDATE users SET photo_profile = ? WHERE id = ?',
@@ -143,7 +143,7 @@ const adminController = {
         );
       }
 
-      // Update admin name if provided
+      // Update admin data
       if (nama) {
         await connection.execute(
           'UPDATE admin SET nama = ? WHERE user_id = ?',
@@ -152,10 +152,12 @@ const adminController = {
       }
 
       await connection.commit();
+
       res.json({
         success: true,
         message: 'Profile berhasil diupdate'
       });
+
     } catch (error) {
       await connection.rollback();
       console.error('Update profile error:', error);
@@ -168,7 +170,7 @@ const adminController = {
     }
   },
 
-  // Generate validation code
+  // Generate new validation code
   generateValidationCode: async (req, res) => {
     try {
       const adminId = req.user.id;
@@ -183,6 +185,7 @@ const adminController = {
         success: true,
         validation_code: newValidationCode
       });
+
     } catch (error) {
       console.error('Generate validation code error:', error);
       res.status(500).json({
@@ -192,7 +195,87 @@ const adminController = {
     }
   },
 
-  // Get mahasiswa list
+  // Create mahasiswa account
+  createMahasiswa: async (req, res) => {
+    const connection = await db.getConnection();
+    try {
+      await connection.beginTransaction();
+
+      const {
+        email,
+        password,
+        nim,
+        nama,
+        institusi,
+        jenis_kelamin,
+        alamat,
+        no_telepon,
+        tanggal_mulai,
+        tanggal_selesai
+      } = req.body;
+
+      const adminId = req.user.id;
+
+      // Hash password
+      const hashedPassword = await bcrypt.hash(password, 10);
+
+      // Create user account
+      const [userResult] = await connection.execute(
+        'INSERT INTO users (email, password, role) VALUES (?, ?, "mahasiswa")',
+        [email, hashedPassword]
+      );
+
+      const userId = userResult.insertId;
+
+      // Generate QR Code
+      const qrCodePath = await qrcodeUtil.generateMahasiswaQR({
+        id: userId,
+        nim,
+        nama
+      });
+
+      // Calculate sisa_hari
+      const start = new Date(tanggal_mulai);
+      const end = new Date(tanggal_selesai);
+      const sisaHari = Math.ceil((end - start) / (1000 * 60 * 60 * 24));
+
+      // Create mahasiswa profile
+      await connection.execute(
+        `INSERT INTO mahasiswa (
+          user_id, admin_id, nim, nama, institusi,
+          jenis_kelamin, alamat, no_telepon, tanggal_mulai, tanggal_selesai,
+          qr_code, status, sisa_hari
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'aktif', ?)`,
+        [userId, adminId, nim, nama, institusi, jenis_kelamin,
+         alamat, no_telepon, tanggal_mulai, tanggal_selesai, qrCodePath, sisaHari]
+      );
+
+      await connection.commit();
+
+      res.status(201).json({
+        success: true,
+        message: 'Akun mahasiswa berhasil dibuat'
+      });
+
+    } catch (error) {
+      await connection.rollback();
+      console.error('Create mahasiswa error:', error);
+      
+      // Delete QR code if exists
+      if (error.qrCodePath) {
+        await qrcodeUtil.deleteQRCode(error.qrCodePath);
+      }
+
+      res.status(500).json({
+        success: false,
+        message: 'Terjadi kesalahan saat membuat akun mahasiswa'
+      });
+    } finally {
+      connection.release();
+    }
+  },
+
+  // Get all mahasiswa under admin
   getMahasiswa: async (req, res) => {
     try {
       const adminId = req.user.id;
@@ -235,88 +318,13 @@ const adminController = {
         success: true,
         data: mahasiswa
       });
+
     } catch (error) {
       console.error('Get mahasiswa error:', error);
       res.status(500).json({
         success: false,
         message: 'Terjadi kesalahan saat mengambil data mahasiswa'
       });
-    }
-  },
-
-  // Create new mahasiswa
-  createMahasiswa: async (req, res) => {
-    const connection = await db.getConnection();
-    try {
-      await connection.beginTransaction();
-
-      const {
-        email,
-        password,
-        nim,
-        nama,
-        institusi,
-        jenis_kelamin,
-        alamat,
-        no_telepon,
-        tanggal_mulai,
-        tanggal_selesai
-      } = req.body;
-      const adminId = req.user.id;
-
-      // Hash password
-      const hashedPassword = await bcrypt.hash(password, 10);
-
-      // Generate QR Code
-      const qrContent = JSON.stringify({
-        nim,
-        nama,
-        institusi,
-        id: uuidv4()
-      });
-      const qrCodeImage = await qr.toDataURL(qrContent);
-
-      // Create user account
-      const [userResult] = await connection.execute(
-        'INSERT INTO users (email, password, role) VALUES (?, ?, "mahasiswa")',
-        [email, hashedPassword]
-      );
-
-      const userId = userResult.insertId;
-
-      // Calculate remaining days
-      const start = new Date(tanggal_mulai);
-      const end = new Date(tanggal_selesai);
-      const sisaHari = Math.ceil((end - start) / (1000 * 60 * 60 * 24));
-
-      // Create mahasiswa profile
-      await connection.execute(
-        `INSERT INTO mahasiswa (
-          user_id, admin_id, nim, nama, institusi,
-          jenis_kelamin, alamat, no_telepon,
-          tanggal_mulai, tanggal_selesai, qr_code,
-          status, sisa_hari
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'aktif', ?)`,
-        [userId, adminId, nim, nama, institusi, jenis_kelamin,
-         alamat, no_telepon, tanggal_mulai, tanggal_selesai,
-         qrCodeImage, sisaHari]
-      );
-
-      await connection.commit();
-
-      res.status(201).json({
-        success: true,
-        message: 'Akun mahasiswa berhasil dibuat'
-      });
-    } catch (error) {
-      await connection.rollback();
-      console.error('Create mahasiswa error:', error);
-      res.status(500).json({
-        success: false,
-        message: 'Terjadi kesalahan saat membuat akun mahasiswa'
-      });
-    } finally {
-      connection.release();
     }
   },
 
@@ -340,7 +348,6 @@ const adminController = {
         });
       }
 
-      // Update status
       await db.execute(
         'UPDATE mahasiswa SET status = ? WHERE id = ?',
         [status, mahasiswaId]
@@ -350,6 +357,7 @@ const adminController = {
         success: true,
         message: 'Status mahasiswa berhasil diupdate'
       });
+
     } catch (error) {
       console.error('Update mahasiswa status error:', error);
       res.status(500).json({
